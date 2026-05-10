@@ -1,0 +1,27 @@
+{
+  "name": "board-game-backend",
+  "version": "1.0.0",
+  "description": "Backend server for multiplayer board game platform",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "nodemon src/index.js"
+  },
+  "keywords": [
+    "board-game",
+    "multiplayer",
+    "socket.io",
+    "express"
+  ],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "socket.io": "^4.7.5"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.0"
+  }
+}
