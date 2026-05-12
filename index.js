@@ -7,7 +7,7 @@ require('dotenv').config();
 const app = express();
 const server = http.createServer(app);
 
-// CORS - Allow frontend to connect later
+// CORS - Allow frontend to connect
 const io = new Server(server, {
   cors: {
     origin: "*", // Change to specific URL in production
@@ -25,9 +25,10 @@ const rooms = new Map();
 // REST API Routes
 app.get('/api/health', (req, res) => {
   res.json({ 
-    status: 'Server is running!',
+    status: 'Chess server running!',
     timestamp: new Date(),
-    activeRooms: rooms.size
+    activeRooms: rooms.size,
+    game: 'chess'
   });
 });
 
@@ -36,13 +37,14 @@ app.post('/api/rooms/create', (req, res) => {
   const room = {
     id: roomId,
     players: [],
-    gameState: initializeGame(),
+    gameState: initializeChessGame(),
     createdAt: new Date(),
-    status: 'waiting'
+    status: 'waiting',
+    timeControl: req.body.timeControl || '10+0'
   };
   
   rooms.set(roomId, room);
-  console.log(`Room created: ${roomId}`);
+  console.log(`Chess room created: ${roomId}`);
   res.json({ roomId, room });
 });
 
@@ -51,6 +53,7 @@ app.get('/api/rooms', (req, res) => {
     id: room.id,
     playerCount: room.players.length,
     status: room.status,
+    timeControl: room.timeControl,
     createdAt: room.createdAt
   }));
   res.json({ rooms: roomList, total: roomList.length });
@@ -91,36 +94,36 @@ io.on('connection', (socket) => {
     }
 
     // Assign player color
-    const playerColor = room.players.length === 0 ? 'red' : 'black';
+    const playerColor = room.players.length === 0 ? 'white' : 'black';
 
-    // Add player to room
     const player = {
       id: socket.id,
       name: playerName,
-      color: playerColor
+      color: playerColor,
+      timeRemaining: getTimeFromControl(room.timeControl)
     };
     room.players.push(player);
     socket.join(roomId);
 
     console.log(`${playerName} joined room ${roomId} as ${playerColor}`);
 
-    // Notify all players in room
     io.to(roomId).emit('playerJoined', {
       players: room.players,
-      message: `${playerName} joined the game as ${playerColor}`,
+      message: `${playerName} joined as ${playerColor}`,
       newPlayer: player
     });
 
     // Start game if 2 players
     if (room.players.length === 2) {
       room.status = 'playing';
+      room.startTime = Date.now();
       io.to(roomId).emit('gameStarted', {
-        message: 'Game started! Red goes first.',
-        gameState: room.gameState
+        message: 'Game started! White moves first.',
+        gameState: room.gameState,
+        players: room.players
       });
     }
 
-    // Send current game state
     socket.emit('gameState', room.gameState);
   });
 
@@ -131,48 +134,95 @@ io.on('connection', (socket) => {
       return;
     }
 
-    // Find player making the move
     const player = room.players.find(p => p.id === socket.id);
     if (!player) {
       socket.emit('error', { message: 'You are not in this room' });
       return;
     }
 
-    // Check if it's player's turn
     if (room.gameState.currentTurn !== player.color) {
       socket.emit('invalidMove', { message: 'Not your turn!' });
       return;
     }
 
     // Validate and process move
-    const isValidMove = validateMove(room.gameState, move, player.color);
-    if (isValidMove) {
-      room.gameState = applyMove(room.gameState, move);
-      
-      // Switch turn
-      room.gameState.currentTurn = player.color === 'red' ? 'black' : 'red';
+    const moveResult = processMove(room.gameState, move, player.color);
+    
+    if (moveResult.valid) {
+      room.gameState = moveResult.newState;
       
       console.log(`Move made in room ${roomId}:`, move);
 
-      // Broadcast to all players
       io.to(roomId).emit('moveMade', {
         gameState: room.gameState,
         move,
-        player: player.name
+        player: player.name,
+        moveNotation: moveResult.notation
       });
 
-      // Check for win condition
-      const winner = checkWinCondition(room.gameState);
-      if (winner) {
+      // Check game end conditions
+      if (room.gameState.gameOver) {
         room.status = 'finished';
         io.to(roomId).emit('gameOver', {
-          winner: winner,
-          message: `${winner} wins!`
+          result: room.gameState.result,
+          reason: room.gameState.gameOverReason,
+          message: getGameOverMessage(room.gameState)
         });
       }
     } else {
-      socket.emit('invalidMove', { message: 'Invalid move' });
+      socket.emit('invalidMove', { 
+        message: moveResult.reason || 'Invalid move',
+        move 
+      });
     }
+  });
+
+  socket.on('offerDraw', ({ roomId }) => {
+    const room = rooms.get(roomId);
+    if (!room) return;
+    
+    const player = room.players.find(p => p.id === socket.id);
+    if (!player) return;
+
+    socket.to(roomId).emit('drawOffered', { 
+      player: player.name 
+    });
+  });
+
+  socket.on('acceptDraw', ({ roomId }) => {
+    const room = rooms.get(roomId);
+    if (!room) return;
+
+    room.gameState.gameOver = true;
+    room.gameState.result = 'draw';
+    room.gameState.gameOverReason = 'Draw by agreement';
+    room.status = 'finished';
+
+    io.to(roomId).emit('gameOver', {
+      result: 'draw',
+      reason: 'Draw by agreement',
+      message: 'Game drawn by mutual agreement'
+    });
+  });
+
+  socket.on('resign', ({ roomId }) => {
+    const room = rooms.get(roomId);
+    if (!room) return;
+
+    const player = room.players.find(p => p.id === socket.id);
+    if (!player) return;
+
+    const winner = player.color === 'white' ? 'black' : 'white';
+    room.gameState.gameOver = true;
+    room.gameState.result = winner;
+    room.gameState.gameOverReason = `${player.color} resigned`;
+    room.status = 'finished';
+
+    io.to(roomId).emit('gameOver', {
+      result: winner,
+      reason: `${player.color} resigned`,
+      message: `${player.name} resigned. ${winner} wins!`
+    });
   });
 
   socket.on('leaveRoom', ({ roomId }) => {
@@ -181,7 +231,6 @@ io.on('connection', (socket) => {
 
   socket.on('disconnect', () => {
     console.log('User disconnected:', socket.id);
-    // Find and handle all rooms this player was in
     rooms.forEach((room, roomId) => {
       const playerIndex = room.players.findIndex(p => p.id === socket.id);
       if (playerIndex !== -1) {
@@ -205,7 +254,6 @@ function handlePlayerLeave(socket, roomId) {
 
   console.log(`${player.name} left room ${roomId}`);
 
-  // Notify other players
   io.to(roomId).emit('playerLeft', {
     players: room.players,
     message: `${player.name} left the game`
@@ -215,160 +263,501 @@ function handlePlayerLeave(socket, roomId) {
   if (room.players.length === 0) {
     rooms.delete(roomId);
     console.log(`Room ${roomId} deleted (empty)`);
+  } else if (room.status === 'playing') {
+    // If game was in progress, opponent wins by abandonment
+    const winner = player.color === 'white' ? 'black' : 'white';
+    room.gameState.gameOver = true;
+    room.gameState.result = winner;
+    room.status = 'finished';
+    io.to(roomId).emit('gameOver', {
+      result: winner,
+      reason: 'Opponent left',
+      message: `${player.name} left. You win by abandonment!`
+    });
   }
 }
 
-function initializeGame() {
+function getTimeFromControl(control) {
+  const [minutes] = control.split('+').map(Number);
+  return minutes * 60 * 1000; // milliseconds
+}
+
+function initializeChessGame() {
   return {
-    board: createInitialBoard(),
-    currentTurn: 'red',
-    status: 'waiting',
-    moveHistory: []
+    board: createInitialChessBoard(),
+    currentTurn: 'white',
+    moveHistory: [],
+    capturedPieces: { white: [], black: [] },
+    castlingRights: {
+      whiteKingside: true,
+      whiteQueenside: true,
+      blackKingside: true,
+      blackQueenside: true
+    },
+    enPassantTarget: null,
+    halfMoveClock: 0,
+    fullMoveNumber: 1,
+    gameOver: false,
+    result: null,
+    gameOverReason: null,
+    check: false,
+    checkmate: false,
+    stalemate: false
   };
 }
 
-function createInitialBoard() {
-  // 8x8 checkers board
-  // null = empty, 'r' = red, 'b' = black, 'R' = red king, 'B' = black king
-  const board = Array(8).fill(null).map(() => Array(8).fill(null));
-  
-  // Place red pieces (top 3 rows)
-  for (let row = 0; row < 3; row++) {
-    for (let col = 0; col < 8; col++) {
-      if ((row + col) % 2 === 1) {
-        board[row][col] = 'r';
-      }
-    }
-  }
-  
-  // Place black pieces (bottom 3 rows)
-  for (let row = 5; row < 8; row++) {
-    for (let col = 0; col < 8; col++) {
-      if ((row + col) % 2 === 1) {
-        board[row][col] = 'b';
-      }
-    }
-  }
-  
-  return board;
+function createInitialChessBoard() {
+  return [
+    ['bR', 'bN', 'bB', 'bQ', 'bK', 'bB', 'bN', 'bR'],
+    ['bP', 'bP', 'bP', 'bP', 'bP', 'bP', 'bP', 'bP'],
+    [null, null, null, null, null, null, null, null],
+    [null, null, null, null, null, null, null, null],
+    [null, null, null, null, null, null, null, null],
+    [null, null, null, null, null, null, null, null],
+    ['wP', 'wP', 'wP', 'wP', 'wP', 'wP', 'wP', 'wP'],
+    ['wR', 'wN', 'wB', 'wQ', 'wK', 'wB', 'wN', 'wR']
+  ];
 }
 
-function validateMove(gameState, move, playerColor) {
+function processMove(gameState, move, playerColor) {
   const { from, to } = move;
-  const { board } = gameState;
   
   // Basic validation
-  if (!from || !to) return false;
-  if (from.row < 0 || from.row >= 8 || from.col < 0 || from.col >= 8) return false;
-  if (to.row < 0 || to.row >= 8 || to.col < 0 || to.col >= 8) return false;
+  if (!isValidPosition(from) || !isValidPosition(to)) {
+    return { valid: false, reason: 'Invalid position' };
+  }
+
+  const piece = gameState.board[from.row][from.col];
+  if (!piece) {
+    return { valid: false, reason: 'No piece at source' };
+  }
+
+  const pieceColor = piece[0] === 'w' ? 'white' : 'black';
+  if (pieceColor !== playerColor) {
+    return { valid: false, reason: 'Not your piece' };
+  }
+
+  // Get legal moves for this piece
+  const legalMoves = getLegalMoves(gameState, from);
+  const isLegal = legalMoves.some(m => m.row === to.row && m.col === to.col);
+
+  if (!isLegal) {
+    return { valid: false, reason: 'Illegal move for this piece' };
+  }
+
+  // Create new board state
+  const newBoard = gameState.board.map(row => [...row]);
+  const targetPiece = newBoard[to.row][to.col];
   
-  const piece = board[from.row][from.col];
-  if (!piece) return false;
-  
-  // Check if piece belongs to current player
-  const pieceColor = piece.toLowerCase();
-  if (pieceColor !== playerColor.charAt(0)) return false;
-  
-  // Check if destination is empty
-  if (board[to.row][to.col] !== null) return false;
-  
-  // Check if moving to dark square
-  if ((to.row + to.col) % 2 === 0) return false;
-  
-  const rowDiff = to.row - from.row;
-  const colDiff = Math.abs(to.col - from.col);
-  
-  // Regular piece movement
-  if (piece === 'r') {
-    // Red moves down (increasing row)
-    if (rowDiff === 1 && colDiff === 1) return true;
-    // Capture move
-    if (rowDiff === 2 && colDiff === 2) {
-      const midRow = from.row + 1;
-      const midCol = from.col + (to.col > from.col ? 1 : -1);
-      const capturedPiece = board[midRow][midCol];
-      return capturedPiece && capturedPiece.toLowerCase() === 'b';
-    }
-  } else if (piece === 'b') {
-    // Black moves up (decreasing row)
-    if (rowDiff === -1 && colDiff === 1) return true;
-    // Capture move
-    if (rowDiff === -2 && colDiff === 2) {
-      const midRow = from.row - 1;
-      const midCol = from.col + (to.col > from.col ? 1 : -1);
-      const capturedPiece = board[midRow][midCol];
-      return capturedPiece && capturedPiece.toLowerCase() === 'r';
-    }
-  } else if (piece === 'R' || piece === 'B') {
-    // Kings can move in any direction
-    if (Math.abs(rowDiff) === 1 && colDiff === 1) return true;
-    // King capture
-    if (Math.abs(rowDiff) === 2 && colDiff === 2) {
-      const midRow = from.row + (rowDiff > 0 ? 1 : -1);
-      const midCol = from.col + (to.col > from.col ? 1 : -1);
-      const capturedPiece = board[midRow][midCol];
-      if (!capturedPiece) return false;
-      // Can capture opposite color
-      const kingColor = piece === 'R' ? 'r' : 'b';
-      const opponentColor = kingColor === 'r' ? 'b' : 'r';
-      return capturedPiece.toLowerCase() === opponentColor;
+  newBoard[to.row][to.col] = piece;
+  newBoard[from.row][from.col] = null;
+
+  // Handle captures
+  if (targetPiece) {
+    const capturedColor = targetPiece[0] === 'w' ? 'white' : 'black';
+    gameState.capturedPieces[capturedColor].push(targetPiece);
+  }
+
+  // Handle castling
+  if (piece[1] === 'K' && Math.abs(to.col - from.col) === 2) {
+    const rookFromCol = to.col > from.col ? 7 : 0;
+    const rookToCol = to.col > from.col ? to.col - 1 : to.col + 1;
+    newBoard[from.row][rookToCol] = newBoard[from.row][rookFromCol];
+    newBoard[from.row][rookFromCol] = null;
+  }
+
+  // Handle pawn promotion
+  if (piece[1] === 'P') {
+    if ((pieceColor === 'white' && to.row === 0) || (pieceColor === 'black' && to.row === 7)) {
+      newBoard[to.row][to.col] = pieceColor[0] + 'Q'; // Auto-promote to queen
     }
   }
-  
+
+  // Update castling rights
+  const newCastlingRights = { ...gameState.castlingRights };
+  if (piece[1] === 'K') {
+    if (pieceColor === 'white') {
+      newCastlingRights.whiteKingside = false;
+      newCastlingRights.whiteQueenside = false;
+    } else {
+      newCastlingRights.blackKingside = false;
+      newCastlingRights.blackQueenside = false;
+    }
+  }
+  if (piece[1] === 'R') {
+    if (from.row === 7 && from.col === 0) newCastlingRights.whiteQueenside = false;
+    if (from.row === 7 && from.col === 7) newCastlingRights.whiteKingside = false;
+    if (from.row === 0 && from.col === 0) newCastlingRights.blackQueenside = false;
+    if (from.row === 0 && from.col === 7) newCastlingRights.blackKingside = false;
+  }
+
+  const newState = {
+    ...gameState,
+    board: newBoard,
+    currentTurn: playerColor === 'white' ? 'black' : 'white',
+    moveHistory: [...gameState.moveHistory, move],
+    castlingRights: newCastlingRights,
+    halfMoveClock: targetPiece || piece[1] === 'P' ? 0 : gameState.halfMoveClock + 1,
+    fullMoveNumber: playerColor === 'black' ? gameState.fullMoveNumber + 1 : gameState.fullMoveNumber
+  };
+
+  // Check for check/checkmate/stalemate
+  const opponentColor = playerColor === 'white' ? 'black' : 'white';
+  const inCheck = isKingInCheck(newState, opponentColor);
+  newState.check = inCheck;
+
+  if (inCheck) {
+    const hasLegalMoves = hasAnyLegalMoves(newState, opponentColor);
+    if (!hasLegalMoves) {
+      newState.checkmate = true;
+      newState.gameOver = true;
+      newState.result = playerColor;
+      newState.gameOverReason = 'Checkmate';
+    }
+  } else {
+    const hasLegalMoves = hasAnyLegalMoves(newState, opponentColor);
+    if (!hasLegalMoves) {
+      newState.stalemate = true;
+      newState.gameOver = true;
+      newState.result = 'draw';
+      newState.gameOverReason = 'Stalemate';
+    }
+  }
+
+  // Check for draw by insufficient material
+  if (isInsufficientMaterial(newState)) {
+    newState.gameOver = true;
+    newState.result = 'draw';
+    newState.gameOverReason = 'Insufficient material';
+  }
+
+  const notation = getMoveNotation(piece, from, to, targetPiece, newState);
+
+  return { valid: true, newState, notation };
+}
+
+function isValidPosition(pos) {
+  return pos && pos.row >= 0 && pos.row < 8 && pos.col >= 0 && pos.col < 8;
+}
+
+function getLegalMoves(gameState, from) {
+  const piece = gameState.board[from.row][from.col];
+  if (!piece) return [];
+
+  const pieceType = piece[1];
+  const pieceColor = piece[0] === 'w' ? 'white' : 'black';
+  const moves = [];
+
+  switch (pieceType) {
+    case 'P':
+      moves.push(...getPawnMoves(gameState, from, pieceColor));
+      break;
+    case 'N':
+      moves.push(...getKnightMoves(gameState, from, pieceColor));
+      break;
+    case 'B':
+      moves.push(...getBishopMoves(gameState, from, pieceColor));
+      break;
+    case 'R':
+      moves.push(...getRookMoves(gameState, from, pieceColor));
+      break;
+    case 'Q':
+      moves.push(...getQueenMoves(gameState, from, pieceColor));
+      break;
+    case 'K':
+      moves.push(...getKingMoves(gameState, from, pieceColor));
+      break;
+  }
+
+  // Filter out moves that would leave king in check
+  return moves.filter(to => !wouldBeInCheck(gameState, from, to, pieceColor));
+}
+
+function getPawnMoves(gameState, from, color) {
+  const moves = [];
+  const direction = color === 'white' ? -1 : 1;
+  const startRow = color === 'white' ? 6 : 1;
+
+  // Forward move
+  const oneForward = { row: from.row + direction, col: from.col };
+  if (isValidPosition(oneForward) && !gameState.board[oneForward.row][oneForward.col]) {
+    moves.push(oneForward);
+
+    // Double move from start
+    if (from.row === startRow) {
+      const twoForward = { row: from.row + 2 * direction, col: from.col };
+      if (!gameState.board[twoForward.row][twoForward.col]) {
+        moves.push(twoForward);
+      }
+    }
+  }
+
+  // Captures
+  const captureOffsets = [-1, 1];
+  for (const offset of captureOffsets) {
+    const capturePos = { row: from.row + direction, col: from.col + offset };
+    if (isValidPosition(capturePos)) {
+      const targetPiece = gameState.board[capturePos.row][capturePos.col];
+      if (targetPiece && targetPiece[0] !== color[0]) {
+        moves.push(capturePos);
+      }
+    }
+  }
+
+  return moves;
+}
+
+function getKnightMoves(gameState, from, color) {
+  const moves = [];
+  const offsets = [
+    [-2, -1], [-2, 1], [-1, -2], [-1, 2],
+    [1, -2], [1, 2], [2, -1], [2, 1]
+  ];
+
+  for (const [dr, dc] of offsets) {
+    const to = { row: from.row + dr, col: from.col + dc };
+    if (isValidPosition(to)) {
+      const targetPiece = gameState.board[to.row][to.col];
+      if (!targetPiece || targetPiece[0] !== color[0]) {
+        moves.push(to);
+      }
+    }
+  }
+
+  return moves;
+}
+
+function getBishopMoves(gameState, from, color) {
+  return getSlidingMoves(gameState, from, color, [[-1,-1], [-1,1], [1,-1], [1,1]]);
+}
+
+function getRookMoves(gameState, from, color) {
+  return getSlidingMoves(gameState, from, color, [[-1,0], [1,0], [0,-1], [0,1]]);
+}
+
+function getQueenMoves(gameState, from, color) {
+  return getSlidingMoves(gameState, from, color, [
+    [-1,-1], [-1,0], [-1,1], [0,-1], [0,1], [1,-1], [1,0], [1,1]
+  ]);
+}
+
+function getSlidingMoves(gameState, from, color, directions) {
+  const moves = [];
+
+  for (const [dr, dc] of directions) {
+    let row = from.row + dr;
+    let col = from.col + dc;
+
+    while (row >= 0 && row < 8 && col >= 0 && col < 8) {
+      const targetPiece = gameState.board[row][col];
+      
+      if (!targetPiece) {
+        moves.push({ row, col });
+      } else {
+        if (targetPiece[0] !== color[0]) {
+          moves.push({ row, col });
+        }
+        break;
+      }
+
+      row += dr;
+      col += dc;
+    }
+  }
+
+  return moves;
+}
+
+function getKingMoves(gameState, from, color) {
+  const moves = [];
+  const offsets = [
+    [-1,-1], [-1,0], [-1,1], [0,-1], [0,1], [1,-1], [1,0], [1,1]
+  ];
+
+  for (const [dr, dc] of offsets) {
+    const to = { row: from.row + dr, col: from.col + dc };
+    if (isValidPosition(to)) {
+      const targetPiece = gameState.board[to.row][to.col];
+      if (!targetPiece || targetPiece[0] !== color[0]) {
+        moves.push(to);
+      }
+    }
+  }
+
+  // Castling
+  const row = color === 'white' ? 7 : 0;
+  if (from.row === row && from.col === 4) {
+    // Kingside
+    const canCastleKingside = color === 'white' 
+      ? gameState.castlingRights.whiteKingside 
+      : gameState.castlingRights.blackKingside;
+    
+    if (canCastleKingside && 
+        !gameState.board[row][5] && 
+        !gameState.board[row][6] &&
+        gameState.board[row][7] === (color[0] + 'R')) {
+      moves.push({ row, col: 6 });
+    }
+
+    // Queenside
+    const canCastleQueenside = color === 'white'
+      ? gameState.castlingRights.whiteQueenside
+      : gameState.castlingRights.blackQueenside;
+    
+    if (canCastleQueenside && 
+        !gameState.board[row][3] && 
+        !gameState.board[row][2] &&
+        !gameState.board[row][1] &&
+        gameState.board[row][0] === (color[0] + 'R')) {
+      moves.push({ row, col: 2 });
+    }
+  }
+
+  return moves;
+}
+
+function wouldBeInCheck(gameState, from, to, color) {
+  const newBoard = gameState.board.map(row => [...row]);
+  newBoard[to.row][to.col] = newBoard[from.row][from.col];
+  newBoard[from.row][from.col] = null;
+
+  const testState = { ...gameState, board: newBoard };
+  return isKingInCheck(testState, color);
+}
+
+function isKingInCheck(gameState, color) {
+  // Find king position
+  let kingPos = null;
+  for (let r = 0; r < 8; r++) {
+    for (let c = 0; c < 8; c++) {
+      const piece = gameState.board[r][c];
+      if (piece === color[0] + 'K') {
+        kingPos = { row: r, col: c };
+        break;
+      }
+    }
+    if (kingPos) break;
+  }
+
+  if (!kingPos) return false;
+
+  // Check if any opponent piece can attack the king
+  const opponentColor = color === 'white' ? 'black' : 'white';
+  for (let r = 0; r < 8; r++) {
+    for (let c = 0; c < 8; c++) {
+      const piece = gameState.board[r][c];
+      if (piece && piece[0] === opponentColor[0]) {
+        const moves = getLegalMovesWithoutCheckTest(gameState, { row: r, col: c }, opponentColor);
+        if (moves.some(m => m.row === kingPos.row && m.col === kingPos.col)) {
+          return true;
+        }
+      }
+    }
+  }
+
   return false;
 }
 
-function applyMove(gameState, move) {
-  const { from, to } = move;
-  const newBoard = gameState.board.map(row => [...row]);
-  
-  const piece = newBoard[from.row][from.col];
-  newBoard[to.row][to.col] = piece;
-  newBoard[from.row][from.col] = null;
-  
-  // Handle capture
-  const rowDiff = to.row - from.row;
-  if (Math.abs(rowDiff) === 2) {
-    const midRow = from.row + (rowDiff > 0 ? 1 : -1);
-    const midCol = from.col + (to.col > from.col ? 1 : -1);
-    newBoard[midRow][midCol] = null; // Remove captured piece
+function getLegalMovesWithoutCheckTest(gameState, from, color) {
+  const piece = gameState.board[from.row][from.col];
+  if (!piece) return [];
+
+  const pieceType = piece[1];
+
+  switch (pieceType) {
+    case 'P': return getPawnMoves(gameState, from, color);
+    case 'N': return getKnightMoves(gameState, from, color);
+    case 'B': return getBishopMoves(gameState, from, color);
+    case 'R': return getRookMoves(gameState, from, color);
+    case 'Q': return getQueenMoves(gameState, from, color);
+    case 'K': return getKingMoves(gameState, from, color).filter(to => {
+      const testBoard = gameState.board.map(row => [...row]);
+      testBoard[to.row][to.col] = testBoard[from.row][from.col];
+      testBoard[from.row][from.col] = null;
+      const testState = { ...gameState, board: testBoard };
+      return !isSquareAttacked(testState, to, color === 'white' ? 'black' : 'white');
+    });
+    default: return [];
   }
-  
-  // Promote to king if reached opposite end
-  if (piece === 'r' && to.row === 7) {
-    newBoard[to.row][to.col] = 'R';
-  } else if (piece === 'b' && to.row === 0) {
-    newBoard[to.row][to.col] = 'B';
-  }
-  
-  return {
-    ...gameState,
-    board: newBoard,
-    moveHistory: [...gameState.moveHistory, move]
-  };
 }
 
-function checkWinCondition(gameState) {
-  const { board } = gameState;
-  let redPieces = 0;
-  let blackPieces = 0;
-  
-  for (let row = 0; row < 8; row++) {
-    for (let col = 0; col < 8; col++) {
-      const piece = board[row][col];
-      if (piece && piece.toLowerCase() === 'r') redPieces++;
-      if (piece && piece.toLowerCase() === 'b') blackPieces++;
+function isSquareAttacked(gameState, square, byColor) {
+  for (let r = 0; r < 8; r++) {
+    for (let c = 0; c < 8; c++) {
+      const piece = gameState.board[r][c];
+      if (piece && piece[0] === byColor[0]) {
+        const moves = getLegalMovesWithoutCheckTest(gameState, { row: r, col: c }, byColor);
+        if (moves.some(m => m.row === square.row && m.col === square.col)) {
+          return true;
+        }
+      }
     }
   }
+  return false;
+}
+
+function hasAnyLegalMoves(gameState, color) {
+  for (let r = 0; r < 8; r++) {
+    for (let c = 0; c < 8; c++) {
+      const piece = gameState.board[r][c];
+      if (piece && piece[0] === color[0]) {
+        const moves = getLegalMoves(gameState, { row: r, col: c });
+        if (moves.length > 0) return true;
+      }
+    }
+  }
+  return false;
+}
+
+function isInsufficientMaterial(gameState) {
+  const pieces = [];
+  for (let r = 0; r < 8; r++) {
+    for (let c = 0; c < 8; c++) {
+      if (gameState.board[r][c]) {
+        pieces.push(gameState.board[r][c]);
+      }
+    }
+  }
+
+  // King vs King
+  if (pieces.length === 2) return true;
+
+  // King + minor piece vs King
+  if (pieces.length === 3) {
+    const hasOnlyMinor = pieces.some(p => p[1] === 'B' || p[1] === 'N');
+    return hasOnlyMinor;
+  }
+
+  return false;
+}
+
+function getMoveNotation(piece, from, to, captured, gameState) {
+  const files = 'abcdefgh';
+  const pieceSymbol = piece[1] === 'P' ? '' : piece[1];
+  const captureSymbol = captured ? 'x' : '';
+  const toSquare = files[to.col] + (8 - to.row);
   
-  if (redPieces === 0) return 'black';
-  if (blackPieces === 0) return 'red';
+  let notation = pieceSymbol + captureSymbol + toSquare;
   
-  return null; // No winner yet
+  if (gameState.checkmate) {
+    notation += '#';
+  } else if (gameState.check) {
+    notation += '+';
+  }
+  
+  return notation;
+}
+
+function getGameOverMessage(gameState) {
+  if (gameState.result === 'draw') {
+    return `Game drawn: ${gameState.gameOverReason}`;
+  } else {
+    return `${gameState.result} wins by ${gameState.gameOverReason}!`;
+  }
 }
 
 const PORT = process.env.PORT || 5000;
 server.listen(PORT, () => {
-  console.log(`🚀 Server running on http://localhost:${PORT}`);
-  console.log(`📡 Socket.io ready for connections`);
+  console.log(`♟️  Chess server running on http://localhost:${PORT}`);
+  console.log(`📡 Socket.io ready for chess games`);
 });
